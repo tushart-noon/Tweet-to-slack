@@ -27,6 +27,7 @@ jobs:
       - name: Fetch tweets and post to Slack
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          X_BEARER_TOKEN: ${{ secrets.X_BEARER_TOKEN }}
         run: python fetch_tweets.py
 
       - name: Save state

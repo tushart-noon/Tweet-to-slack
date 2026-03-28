@@ -1,27 +1,25 @@
 #!/usr/bin/env python3
 """
-Fetch tweets from specified Twitter/X users and post new ones to Slack.
-Uses multiple methods: X syndication API, Nitter RSS, and RSSHub as fallbacks.
+Fetch tweets from specified Twitter/X users via X API v2 and post new ones to Slack.
 Tracks already-posted tweets in posted_tweets.json to avoid duplicates.
 """
 
 import json
 import os
-import re
 import sys
 import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from html import unescape
+from urllib.parse import unquote
 
-import feedparser
 import requests
 
 # --- Configuration ---
 SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")
+X_BEARER_TOKEN = os.environ.get("X_BEARER_TOKEN")
 CONFIG_FILE = Path(__file__).parent / "config.json"
 STATE_FILE = Path(__file__).parent / "posted_tweets.json"
-MAX_TWEET_AGE_HOURS = 48  # Post tweets from the last 48 hours
+MAX_TWEET_AGE_HOURS = 48
 
 
 def load_config():
@@ -33,7 +31,7 @@ def load_posted_tweets():
     if STATE_FILE.exists():
         with open(STATE_FILE) as f:
             return json.load(f)
-    return {"posted_ids": []}
+    return {"posted_ids": [], "user_ids": {}}
 
 
 def save_posted_tweets(state):
@@ -42,142 +40,81 @@ def save_posted_tweets(state):
         json.dump(state, f, indent=2)
 
 
-def strip_html(text):
-    """Remove HTML tags from text."""
-    clean = re.sub(r'<[^>]+>', '', text)
-    return unescape(clean).strip()
-
-
-def fetch_via_syndication(handle):
-    """Fetch tweets using X's syndication/embed timeline endpoint."""
-    url = f"https://syndication.twitter.com/srv/timeline-profile/screen-name/{handle}"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "text/html,application/xhtml+xml",
+def x_api_headers():
+    """Get headers for X API requests."""
+    token = unquote(X_BEARER_TOKEN)  # Decode URL-encoded token
+    return {
+        "Authorization": f"Bearer {token}",
+        "User-Agent": "TweetToSlack/1.0",
     }
-    try:
-        print(f"  Trying syndication API...")
-        resp = requests.get(url, timeout=15, headers=headers)
-        if resp.status_code == 200 and resp.text:
-            # Parse tweet data from the HTML response
-            tweets = []
-            # Find tweet links and text content
-            tweet_pattern = re.findall(
-                r'<a[^>]*href="https://twitter\.com/[^/]+/status/(\d+)"[^>]*>.*?</a>',
-                resp.text, re.DOTALL
-            )
-            # Extract tweet text blocks
-            text_blocks = re.findall(
-                r'<p[^>]*class="[^"]*timeline-Tweet-text[^"]*"[^>]*>(.*?)</p>',
-                resp.text, re.DOTALL
-            )
-
-            seen_ids = set()
-            for i, tweet_id in enumerate(tweet_pattern):
-                if tweet_id not in seen_ids:
-                    seen_ids.add(tweet_id)
-                    text = strip_html(text_blocks[i]) if i < len(text_blocks) else ""
-                    tweets.append({
-                        "id": tweet_id,
-                        "text": text,
-                        "link": f"https://x.com/{handle}/status/{tweet_id}",
-                    })
-
-            if tweets:
-                print(f"  Got {len(tweets)} tweets from syndication API")
-                return tweets
-    except Exception as e:
-        print(f"  Syndication failed: {e}")
-    return []
 
 
-def fetch_via_rss(handle, instances):
-    """Try multiple RSSHub/Nitter instances to fetch a user's tweet feed."""
-    for instance in instances:
-        url = f"{instance}/twitter/user/{handle}"
-        try:
-            print(f"  Trying {url}...")
-            resp = requests.get(url, timeout=15, headers={"User-Agent": "TweetToSlack/1.0"})
-            if resp.status_code == 200:
-                feed = feedparser.parse(resp.text)
-                if feed.entries:
-                    print(f"  Got {len(feed.entries)} entries from {instance}")
-                    tweets = []
-                    for entry in feed.entries:
-                        link = entry.get("link", "")
-                        tweet_id = link.split("/status/")[-1].split("?")[0] if "/status/" in link else entry.get("id", link)
-                        text = strip_html(entry.get("summary", entry.get("title", "")))
-                        tweets.append({
-                            "id": tweet_id,
-                            "text": text,
-                            "link": link,
-                        })
-                    return tweets
-        except requests.RequestException as e:
-            print(f"  Failed: {e}")
-            continue
-    return []
+def get_user_id(handle, state):
+    """Look up a Twitter user ID by handle. Caches in state."""
+    if handle in state.get("user_ids", {}):
+        return state["user_ids"][handle]
+
+    url = f"https://api.x.com/2/users/by/username/{handle}"
+    resp = requests.get(url, headers=x_api_headers(), timeout=15)
+    print(f"  User lookup for @{handle}: {resp.status_code}")
+
+    if resp.status_code == 200:
+        data = resp.json()
+        if "data" in data:
+            user_id = data["data"]["id"]
+            if "user_ids" not in state:
+                state["user_ids"] = {}
+            state["user_ids"][handle] = user_id
+            print(f"  Found user ID: {user_id}")
+            return user_id
+
+    print(f"  User lookup failed: {resp.text[:200]}")
+    return None
 
 
-def fetch_via_nitter(handle):
-    """Try Nitter instances for RSS feeds."""
-    nitter_instances = [
-        "https://nitter.privacydev.net",
-        "https://nitter.poast.org",
-        "https://nitter.woodland.cafe",
-    ]
-    for instance in nitter_instances:
-        url = f"{instance}/{handle}/rss"
-        try:
-            print(f"  Trying {url}...")
-            resp = requests.get(url, timeout=15, headers={"User-Agent": "TweetToSlack/1.0"})
-            if resp.status_code == 200:
-                feed = feedparser.parse(resp.text)
-                if feed.entries:
-                    print(f"  Got {len(feed.entries)} entries from Nitter")
-                    tweets = []
-                    for entry in feed.entries:
-                        link = entry.get("link", "").replace(instance, "https://x.com")
-                        tweet_id = link.split("/status/")[-1].split("#")[0] if "/status/" in link else entry.get("id", "")
-                        text = strip_html(entry.get("title", entry.get("summary", "")))
-                        tweets.append({
-                            "id": tweet_id,
-                            "text": text,
-                            "link": link,
-                        })
-                    return tweets
-        except requests.RequestException as e:
-            print(f"  Failed: {e}")
-            continue
-    return []
+def fetch_user_tweets(handle, user_id):
+    """Fetch recent tweets for a user via X API v2."""
+    # Get tweets from the last 48 hours
+    since = (datetime.now(timezone.utc) - timedelta(hours=MAX_TWEET_AGE_HOURS)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
+    url = f"https://api.x.com/2/users/{user_id}/tweets"
+    params = {
+        "max_results": 10,
+        "start_time": since,
+        "tweet.fields": "created_at,text,public_metrics",
+        "exclude": "retweets,replies",
+    }
 
-def fetch_user_tweets(handle, rsshub_instances):
-    """Try all methods to fetch tweets for a user."""
-    # Method 1: X Syndication API
-    tweets = fetch_via_syndication(handle)
-    if tweets:
+    resp = requests.get(url, headers=x_api_headers(), params=params, timeout=15)
+    print(f"  Tweets API for @{handle}: {resp.status_code}")
+
+    if resp.status_code == 200:
+        data = resp.json()
+        tweets = data.get("data", [])
+        print(f"  Found {len(tweets)} tweets")
         return tweets
-
-    # Method 2: Nitter RSS
-    tweets = fetch_via_nitter(handle)
-    if tweets:
-        return tweets
-
-    # Method 3: RSSHub instances
-    tweets = fetch_via_rss(handle, rsshub_instances)
-    if tweets:
-        return tweets
-
-    print(f"  All methods failed for @{handle}")
-    return []
+    else:
+        print(f"  Tweets API failed: {resp.text[:300]}")
+        return []
 
 
 def format_slack_message(tweet, handle):
     """Format a tweet as a nice Slack message."""
     text = tweet["text"]
+    tweet_id = tweet["id"]
+    link = f"https://x.com/{handle}/status/{tweet_id}"
+
     if len(text) > 500:
         text = text[:497] + "..."
+
+    # Add engagement stats if available
+    metrics = tweet.get("public_metrics", {})
+    stats = ""
+    if metrics:
+        likes = metrics.get("like_count", 0)
+        rts = metrics.get("retweet_count", 0)
+        if likes or rts:
+            stats = f"\n\n:heart: {likes}  :repeat: {rts}"
 
     return {
         "blocks": [
@@ -185,7 +122,7 @@ def format_slack_message(tweet, handle):
                 "type": "section",
                 "text": {
                     "type": "mrkdwn",
-                    "text": f"*New tweet from <https://x.com/{handle}|@{handle}>* :bird:\n\n{text}"
+                    "text": f"*New tweet from <https://x.com/{handle}|@{handle}>* :bird:\n\n{text}{stats}"
                 }
             },
             {
@@ -194,8 +131,8 @@ def format_slack_message(tweet, handle):
                     {
                         "type": "button",
                         "text": {"type": "plain_text", "text": ":heart: Like & RT on X"},
-                        "url": tweet["link"],
-                        "action_id": f"open_tweet_{tweet['id']}"
+                        "url": link,
+                        "action_id": f"open_tweet_{tweet_id}"
                     }
                 ]
             },
@@ -222,11 +159,13 @@ def main():
     if not SLACK_WEBHOOK_URL:
         print("ERROR: SLACK_WEBHOOK_URL environment variable not set")
         sys.exit(1)
+    if not X_BEARER_TOKEN:
+        print("ERROR: X_BEARER_TOKEN environment variable not set")
+        sys.exit(1)
 
     config = load_config()
     state = load_posted_tweets()
     handles = config["twitter_handles"]
-    rsshub_instances = config.get("rsshub_instances", [])
     new_tweets_count = 0
 
     print(f"Checking tweets for: {', '.join(handles)}")
@@ -234,15 +173,20 @@ def main():
 
     for handle in handles:
         print(f"\nFetching @{handle}...")
-        tweets = fetch_user_tweets(handle, rsshub_instances)
+
+        # Get user ID
+        user_id = get_user_id(handle, state)
+        if not user_id:
+            print(f"  Skipping @{handle} - could not resolve user ID")
+            continue
+
+        # Fetch tweets
+        tweets = fetch_user_tweets(handle, user_id)
 
         for tweet in tweets:
             tweet_id = tweet["id"]
 
             if tweet_id in state["posted_ids"]:
-                continue
-
-            if not tweet["text"]:
                 continue
 
             print(f"  New tweet found: {tweet_id}")
@@ -252,7 +196,7 @@ def main():
                 state["posted_ids"].append(tweet_id)
                 new_tweets_count += 1
                 print(f"  Posted to Slack!")
-                time.sleep(1)  # Rate limit courtesy
+                time.sleep(1)
             else:
                 print(f"  Failed to post to Slack")
 
