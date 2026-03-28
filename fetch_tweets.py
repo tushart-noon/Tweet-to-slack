@@ -19,7 +19,7 @@ SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL")
 X_BEARER_TOKEN = os.environ.get("X_BEARER_TOKEN")
 CONFIG_FILE = Path(__file__).parent / "config.json"
 STATE_FILE = Path(__file__).parent / "posted_tweets.json"
-MAX_TWEET_AGE_HOURS = 96  # 4 days
+MAX_TWEET_AGE_HOURS = 48
 
 
 def load_config():
