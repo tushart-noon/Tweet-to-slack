@@ -10,7 +10,7 @@ import sys
 import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from urllib.parse import unquote
+# from urllib.parse import unquote  # No longer needed
 
 import requests
 
@@ -42,7 +42,7 @@ def save_posted_tweets(state):
 
 def x_api_headers():
     """Get headers for X API requests."""
-    token = unquote(X_BEARER_TOKEN)  # Decode URL-encoded token
+    token = X_BEARER_TOKEN  # Token is URL-encoded, X API accepts it directly
     return {
         "Authorization": f"Bearer {token}",
         "User-Agent": "TweetToSlack/1.0",
